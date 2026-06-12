@@ -42,7 +42,9 @@ class YouTube:
 
         # Get API configuration from config
         self.api_url = config.ARTISTBOTS_API_URL
+        self.video_api_url = config.VIDEO_API_URL
         self.artistbots_key = config.ARTISTBOTS_KEY
+        self.nexgen_key = config.API_KEY
         self.enable_api = config.ENABLE_API
         self.enable_cookies_fallback = config.ENABLE_COOKIES_FALLBACK
         self.api_timeout = config.API_TIMEOUT
@@ -73,6 +75,79 @@ class YouTube:
                 logger.warning("⚠️ No API Key configured!")
         logger.info(f"🍪 Cookies Fallback: {'ENABLED' if self.enable_cookies_fallback else 'DISABLED'}")
         logger.info("=" * 50)
+
+    async def _save_api_file(self, session: aiohttp.ClientSession, video_id: str, url: str, video: bool = False) -> Optional[str]:
+        """Save a direct API download URL to the downloads directory."""
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=self.api_stream_timeout),
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"NexGen download URL returned status {response.status}")
+                    return None
+
+                content_disposition = response.headers.get("Content-Disposition", "")
+                file_name = None
+                match = re.search(r'filename="?([^";]+)"?', content_disposition)
+                if match:
+                    file_name = match.group(1)
+                if not file_name:
+                    file_name = video_id + (".mp4" if video else ".mp3")
+
+                os.makedirs("downloads", exist_ok=True)
+                file_path = os.path.join("downloads", file_name)
+                with open(file_path, "wb") as file:
+                    async for chunk in response.content.iter_chunked(128 * 1024):
+                        if chunk:
+                            file.write(chunk)
+
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    return file_path
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        except Exception as e:
+            logger.error(f"NexGen file save failed for {video_id}: {type(e).__name__}: {e}")
+        return None
+
+    async def download_via_nexgen(self, video_id: str, video: bool = False) -> Optional[str]:
+        """Download using the NexGenBots API shape from the supplied youtube.py."""
+        key = self.nexgen_key or self.artistbots_key
+        if not key or not self.api_url or (video and not self.video_api_url):
+            return None
+
+        existing = self._locate_download_file(video_id, video=video)
+        if existing:
+            return existing
+
+        base_url = self.video_api_url if video else self.api_url
+        endpoint_type = "video" if video else "song"
+        endpoint = f"{base_url.rstrip('/')}/{endpoint_type}/{video_id}"
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.api_timeout),
+                headers={"Accept": "application/json"},
+            ) as session:
+                for _ in range(10):
+                    async with session.get(endpoint, params={"api": key}) as response:
+                        if response.status != 200:
+                            logger.error(f"NexGen API returned status {response.status} for {video_id}")
+                            return None
+
+                        data = await response.json(content_type=None)
+                        status = data.get("status")
+                        download_link = data.get("link")
+
+                        if status == "done" and download_link:
+                            return await self._save_api_file(session, video_id, download_link, video=video)
+                        if status == "downloading":
+                            await asyncio.sleep(4)
+                            continue
+                        return None
+        except Exception as e:
+            logger.error(f"NexGen API download failed for {video_id}: {type(e).__name__}: {e}")
+        return None
 
     def _locate_download_file(self, video_id: str, video: bool = False) -> Optional[str]:
         """Locate any completed download file for a video id."""
@@ -657,7 +732,9 @@ class YouTube:
         # Try API first (Primary)
         if self.enable_api and self.api_url and self.artistbots_key:
             logger.info(f"🎯 [PRIORITY 1] Trying API download for {video_id}")
-            result = await self.download_via_api(self.base + video_id, video=video)
+            result = await self.download_via_nexgen(video_id, video=video)
+            if not result:
+                result = await self.download_via_api(self.base + video_id, video=video)
             
             if result:
                 logger.info(f"✅ [SUCCESS] Downloaded via API: {video_id}")
